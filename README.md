@@ -1,135 +1,81 @@
 # k8s-nodepool-controller
-// TODO(user): Add simple overview of use/purpose
+A Kubernetes control-plane component that manages the lifecycle
+of NodePools and their member nodes — applying labels/taints on join, keeping them in
+sync on spec changes, and cleaning up cluster state when the infra layer takes a node
+away. Test cases are mostly AI generated.
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
 
-## Getting Started
+## Build & run locally (kind / minikube instructions).
 
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+To test the controller locally on a kind cluster:
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
-
-```sh
-make docker-build docker-push IMG=<some-registry>/k8s-nodepool-controller:tag
+```bash
+   kind create cluster --name nishant-demo --image kindest/node:v1.35.0
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
-
-**Install the CRDs into the cluster:**
-
-```sh
-make install
+```bash
+   make docker-build IMG=controller:dev
+   kind load docker-image controller:dev --name nishant-demo
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
-
-```sh
-make deploy IMG=<some-registry>/k8s-nodepool-controller:tag
+```bash
+   make manifests
+   make install
+   make deploy IMG=controller:dev
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+## Demo Scripts
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+Demo script and an asciinema recording in the `demo/` directory (the demo script creates a kind cluster):
 
-```sh
-kubectl apply -k config/samples/
-```
+- Run `bash demo/demo.sh` to see the controller managing a NodePool on a kind cluster.
+- To watch the recording:
+  ```bash
+  asciinema play demo/demo.cast
+  ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+## Running tests
+For unit and e2e use `make test` and `make test-e2e` respectively.
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
 
-```sh
-kubectl delete -k config/samples/
-```
+## Design Decisions
+### 1. Label/taint ownership. How does your controller distinguish labels/taints it applied from ones applied by other actors? What happens when a human sets a matching label manually?
 
-**Delete the APIs(CRDs) from the cluster:**
+We use server-side apply to track the fields we own. If a human manually sets a label we manage, it's a conflict unless they force it. if they force it, we simply overwrite it on the next reconcile because we strictly enforce the declared state.
+If overriding the labels or taints is actually required, the node can be removed from the NodePool by removing the bootstrap label with puts the Node under the NodePool.
 
-```sh
-make uninstall
-```
+### 2. Reconciliation triggers. What Watches does your controller set up? How does the controller find the owning NodePool from a Node event?
 
-**UnDeploy the controller from the cluster:**
+NodePool objects are watched by the Reconciler and we have set up a secondary watch on `node` objects. When a node event fires, a map function inspects the `nodes.example.com/nodepool` label to instantly find and enqueue the owning nodepool.
 
-```sh
-make undeploy
-```
+### 3. Grace-period clock. Where does the "how long has this node been NotReady" timer live — status field, Node condition timestamp, or in-memory? Which survives a controller restart correctly?
 
-## Project Distribution
+We setup a next reconcile for the time when the first unstable node's grace period expires.
+The next reconcile would calculate and check if grace period has expired and handle it accordingly.
 
-Following the options to release and provide this solution to the users.
+### 4. Ready=False vs Ready=Unknown. Do you treat these differently? Why or why not?
 
-### By providing a bundle with all YAML files
+We treat both the same. `false` means the kubelet is reporting a hard failure, `unknown` means the kubelet stopped reporting. Both mean the node can't run workloads and require some action to be taken.
 
-1. Build the installer for the image built and published in the registry:
+### 5. Force-delete safety. After eviction times out, do you force-delete pods? What's the risk? What guardrails do you add?
 
-```sh
-make build-installer IMG=<some-registry>/k8s-nodepool-controller:tag
-```
+We don't force-delete pods directly. Instead, we delete the node object, which prompts kcm to force-delete the pods. the risk is split-brain (pods still running on a partitioned node corrupting storage). One guardrail that can be added if to force shutdown the actual VM that powers this node.
+So that it doesn't keep running pods when we have assumed it to be dead.
 
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
+### 6. Failure modes. Controller crashes mid-removal — what state does it come back to, and does it resume correctly?
+The controller reads the state at start and it resumes processing the state it reads at startup and the events it starts getting from the watches.
 
-2. Using the installer
+### 7. Concurrency. Two NodePools accidentally match the same Node (bootstrap label was set twice, or your matching is looser than a single label). What happens?
 
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
+Our mapping relies on the label key `nodes.example.com/nodepool`. If we try and loosen it up, there is a chance of two nodepool resources pick the same Node, in which case both the reconcile loops would keep fighting. One possible solution is to add a validating webhook to validate NodePool objects at admission.
 
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/k8s-nodepool-controller/<tag or branch>/dist/install.yaml
-```
 
-### By providing a Helm Chart
+### 8. Composition with kube-controller-manager. node-lifecycle-controller already taints NotReady nodes with node.kubernetes.io/unreachable:NoExecute and evicts pods. What does your controller add on top?
 
-1. Build the chart using the optional helm plugin
+It evicts pods but doesn't remove the dead node from the cluster or enforce rate limits on node failures. This controller adds automated removal, custom grace periods per pool, and  `maxConcurrentRemovals` to perform removal in a controlled manner.
 
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
 
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
-
-## License
-
-Copyright 2026 Nishant Hooda.
-
-Licensed under the GNU Affero General Public License, Version 3.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    https://www.gnu.org/licenses/agpl-3.0.en.html
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+## Known Limitations and possible improvements
+- We rely on Kubernetes' native controller to evict pods when a node becomes unready. We could add proactive drain logic.
+- We do not actually terminate the underlying node.
+- Helm chart is generated by kubebuilder, not tested by helm install.

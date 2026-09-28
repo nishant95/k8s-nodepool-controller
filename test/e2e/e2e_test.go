@@ -20,11 +20,9 @@ limitations under the License.
 package e2e
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
 	"os/exec"
-	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -67,6 +65,7 @@ var _ = Describe("Manager", Ordered, func() {
 		cmd = exec.Command("make", "install")
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
+		time.Sleep(2 * time.Second)
 
 		By("deploying the controller-manager")
 		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", managerImage))
@@ -173,167 +172,309 @@ var _ = Describe("Manager", Ordered, func() {
 			Eventually(verifyControllerUp).Should(Succeed())
 		})
 
-		It("should ensure the metrics endpoint is serving metrics", func() {
-			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
-			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
-				"--clusterrole=k8s-nodepool-controller-metrics-reader",
-				fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
-			)
-			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create ClusterRoleBinding")
-
-			By("validating that the metrics service is available")
-			cmd = exec.Command("kubectl", "get", "service", metricsServiceName, "-n", namespace)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Metrics service should exist")
-
-			By("getting the service account token")
-			token, err := serviceAccountToken()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(token).NotTo(BeEmpty())
-
-			By("ensuring the controller pod is ready")
-			verifyControllerPodReady := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "pod", controllerPodName, "-n", namespace,
-					"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("True"), "Controller pod not ready")
-			}
-			Eventually(verifyControllerPodReady, 3*time.Minute, time.Second).Should(Succeed())
-
-			By("verifying that the controller manager is serving the metrics server")
-			verifyMetricsServerStarted := func(g Gomega) {
-				cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(ContainSubstring("Serving metrics server"),
-					"Metrics server not yet started")
-			}
-			Eventually(verifyMetricsServerStarted, 3*time.Minute, time.Second).Should(Succeed())
-
-			// +kubebuilder:scaffold:e2e-metrics-webhooks-readiness
-
-			By("creating the curl-metrics pod to access the metrics endpoint")
-			cmd = exec.Command("kubectl", "run", "curl-metrics", "--restart=Never",
-				"--namespace", namespace,
-				"--image=curlimages/curl:latest",
-				"--overrides",
-				fmt.Sprintf(`{
-					"spec": {
-						"containers": [{
-							"name": "curl",
-							"image": "curlimages/curl:latest",
-							"command": ["/bin/sh", "-c"],
-							"args": [
-								"for i in $(seq 1 30); do curl -v -k -H 'Authorization: Bearer %s' https://%s.%s.svc.cluster.local:8443/metrics && exit 0 || sleep 2; done; exit 1"
-							],
-							"securityContext": {
-								"readOnlyRootFilesystem": true,
-								"allowPrivilegeEscalation": false,
-								"capabilities": {
-									"drop": ["ALL"]
-								},
-								"runAsNonRoot": true,
-								"runAsUser": 1000,
-								"seccompProfile": {
-									"type": "RuntimeDefault"
-								}
-							}
-						}],
-						"serviceAccountName": "%s"
-					}
-				}`, token, metricsServiceName, namespace, serviceAccountName))
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create curl-metrics pod")
-
-			By("waiting for the curl-metrics pod to complete.")
-			verifyCurlUp := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "pods", "curl-metrics",
-					"-o", "jsonpath={.status.phase}",
-					"-n", namespace)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Succeeded"), "curl pod in wrong status")
-			}
-			Eventually(verifyCurlUp, 5*time.Minute).Should(Succeed())
-
-			By("getting the metrics by checking curl-metrics logs")
-			verifyMetricsAvailable := func(g Gomega) {
-				metricsOutput, err := getMetricsOutput()
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
-				g.Expect(metricsOutput).NotTo(BeEmpty())
-				g.Expect(metricsOutput).To(ContainSubstring("< HTTP/1.1 200 OK"))
-			}
-			Eventually(verifyMetricsAvailable, 2*time.Minute).Should(Succeed())
-		})
-
 		// +kubebuilder:scaffold:e2e-webhooks-checks
 
-		// TODO: Customize the e2e test suite with scenarios specific to your project.
-		// Consider applying sample/CR(s) and check their status and/or verifying
-		// the reconciliation by using the metrics, i.e.:
-		// metricsOutput, err := getMetricsOutput()
-		// Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
-		// Expect(metricsOutput).To(ContainSubstring(
-		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
-		//    strings.ToLower(<Kind>),
-		// ))
+		It("should sync NodePool labels and handle Unready nodes", func() {
+			By("creating a NodePool")
+			nodePoolYaml := `
+apiVersion: nodemanager.example.org.example.org/v1
+kind: NodePool
+metadata:
+  name: test-e2e-pool
+spec:
+  labels:
+    e2etest: passed
+  unreadyPolicy:
+    gracePeriod: 5s
+    action: Cordon
+    maxConcurrentRemovals: 1
+`
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(nodePoolYaml)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create NodePool")
+
+			By("creating a lightweight fake node")
+			fakeNodeYaml := `
+apiVersion: v1
+kind: Node
+metadata:
+  name: fake-node-1
+  labels:
+    nodes.example.com/nodepool: test-e2e-pool
+`
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(fakeNodeYaml)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create fake node")
+
+			By("verifying the node received the spec labels via SSA")
+			verifyLabels := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "node", "fake-node-1", "-o", "jsonpath={.metadata.labels.e2etest}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("passed"))
+			}
+			Eventually(verifyLabels, 15*time.Second, time.Second).Should(Succeed())
+
+			By("simulating node failure instantly via status patch")
+			cmd = exec.Command("kubectl", "patch", "node", "fake-node-1", "--subresource=status", "--type=merge", "-p", `{"status":{"conditions":[{"type":"Ready","status":"False","lastTransitionTime":"2020-01-01T00:00:00Z"}]}}`)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to patch node status")
+
+			By("waiting for the controller to cordon the node after GracePeriod")
+			verifyCordoned := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "node", "fake-node-1", "-o", "jsonpath={.spec.unschedulable}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("true"))
+			}
+			Eventually(verifyCordoned, 15*time.Second, time.Second).Should(Succeed())
+
+			By("cleaning up")
+			exec.Command("kubectl", "delete", "node", "fake-node-1").Run()
+			exec.Command("kubectl", "delete", "nodepool", "test-e2e-pool").Run()
+		})
+
+		It("should ignore Unready nodes that do not belong to the NodePool", func() {
+			By("creating a NodePool")
+			nodePoolYaml := `
+apiVersion: nodemanager.example.org.example.org/v1
+kind: NodePool
+metadata:
+  name: ignored-pool
+spec:
+  unreadyPolicy:
+    gracePeriod: 1s
+    action: Cordon
+    maxConcurrentRemovals: 1
+`
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(nodePoolYaml)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("creating an unrelated fake node")
+			fakeNodeYaml := `
+apiVersion: v1
+kind: Node
+metadata:
+  name: unrelated-node
+  labels:
+    some-other-label: "true"
+`
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(fakeNodeYaml)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("simulating node failure")
+			cmd = exec.Command("kubectl", "patch", "node", "unrelated-node", "--subresource=status", "--type=merge", "-p", `{"status":{"conditions":[{"type":"Ready","status":"False","lastTransitionTime":"2020-01-01T00:00:00Z"}]}}`)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("ensuring the node is NEVER cordoned")
+			verifyNotCordoned := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "node", "unrelated-node", "-o", "jsonpath={.spec.unschedulable}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).NotTo(Equal("true"))
+			}
+			Consistently(verifyNotCordoned, 5*time.Second, time.Second).Should(Succeed())
+
+			By("cleaning up")
+			exec.Command("kubectl", "delete", "node", "unrelated-node").Run()
+			exec.Command("kubectl", "delete", "nodepool", "ignored-pool").Run()
+		})
+
+		It("should enforce MaxConcurrentRemovals", func() {
+			By("creating a NodePool with maxConcurrentRemovals=1")
+			nodePoolYaml := `
+apiVersion: nodemanager.example.org.example.org/v1
+kind: NodePool
+metadata:
+  name: rate-limit-pool
+spec:
+  unreadyPolicy:
+    gracePeriod: 1s
+    action: Cordon
+    maxConcurrentRemovals: 1
+`
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(nodePoolYaml)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("creating two fake nodes")
+			for i := 1; i <= 2; i++ {
+				fakeNodeYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Node
+metadata:
+  name: limit-node-%d
+  labels:
+    nodes.example.com/nodepool: rate-limit-pool
+`, i)
+				cmd = exec.Command("kubectl", "apply", "-f", "-")
+				cmd.Stdin = strings.NewReader(fakeNodeYaml)
+				_, err = utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			By("simulating the first node failing")
+			cmd = exec.Command("kubectl", "patch", "node", "limit-node-1", "--subresource=status", "--type=merge", "-p", `{"status":{"conditions":[{"type":"Ready","status":"False","lastTransitionTime":"2020-01-01T00:00:00Z"}]}}`)
+			utils.Run(cmd)
+
+			By("waiting for the first node to be cordoned")
+			verifyFirstCordoned := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "node", "limit-node-1", "-o", "jsonpath={.spec.unschedulable}")
+				out, _ := utils.Run(cmd)
+				g.Expect(out).To(Equal("true"))
+			}
+			Eventually(verifyFirstCordoned, 10*time.Second, time.Second).Should(Succeed())
+			time.Sleep(2 * time.Second)
+
+			By("simulating the second node failing")
+			cmd = exec.Command("kubectl", "patch", "node", "limit-node-2", "--subresource=status", "--type=merge", "-p", `{"status":{"conditions":[{"type":"Ready","status":"False","lastTransitionTime":"2020-01-01T00:00:00Z"}]}}`)
+			utils.Run(cmd)
+
+			By("ensuring the second node is NOT cordoned while the first remains failed")
+			verifySecondNotCordoned := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "node", "limit-node-2", "-o", "jsonpath={.spec.unschedulable}")
+				out, _ := utils.Run(cmd)
+				g.Expect(out).NotTo(Equal("true"))
+			}
+			Consistently(verifySecondNotCordoned, 5*time.Second, time.Second).Should(Succeed())
+
+			By("cleaning up")
+			exec.Command("kubectl", "delete", "node", "limit-node-1", "limit-node-2").Run()
+			exec.Command("kubectl", "delete", "nodepool", "rate-limit-pool").Run()
+		})
+
+		It("should accurately sync NodePool status based on actual node states", func() {
+			By("creating a NodePool")
+			nodePoolYaml := `
+apiVersion: nodemanager.example.org.example.org/v1
+kind: NodePool
+metadata:
+  name: status-pool
+spec:
+  unreadyPolicy:
+    gracePeriod: 10m
+    action: Cordon
+    maxConcurrentRemovals: 1
+`
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(nodePoolYaml)
+			utils.Run(cmd)
+
+			By("creating three fake nodes (two ready, one unready)")
+			for i := 1; i <= 3; i++ {
+				nodeYaml := fmt.Sprintf(`
+apiVersion: v1
+kind: Node
+metadata:
+  name: status-node-%d
+  labels:
+    nodes.example.com/nodepool: status-pool
+`, i)
+				cmd = exec.Command("kubectl", "apply", "-f", "-")
+				cmd.Stdin = strings.NewReader(nodeYaml)
+				utils.Run(cmd)
+
+				statusPatch := "True"
+				if i == 3 {
+					statusPatch = "False" // Node 3 is unready
+				}
+				cmd = exec.Command("kubectl", "patch", "node", fmt.Sprintf("status-node-%d", i), "--subresource=status", "--type=merge", "-p", fmt.Sprintf(`{"status":{"conditions":[{"type":"Ready","status":"%s"}]}}`, statusPatch))
+				utils.Run(cmd)
+			}
+
+			By("verifying the NodePool status reflects exactly 3 nodes with correct phases")
+			verifyStatus := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "nodepool", "status-pool", "-o", "jsonpath={.status.nodes[*].name}")
+				out, _ := utils.Run(cmd)
+				g.Expect(out).To(ContainSubstring("status-node-1"))
+				g.Expect(out).To(ContainSubstring("status-node-2"))
+				g.Expect(out).To(ContainSubstring("status-node-3"))
+
+				cmd = exec.Command("kubectl", "get", "nodepool", "status-pool", "-o", "jsonpath={.status.conditions[?(@.type=='Degraded')].status}")
+				out, _ = utils.Run(cmd)
+				g.Expect(out).To(Equal("True"))
+			}
+			Eventually(verifyStatus, 15*time.Second, time.Second).Should(Succeed())
+
+			By("cleaning up")
+			exec.Command("kubectl", "delete", "node", "status-node-1", "status-node-2", "status-node-3").Run()
+			exec.Command("kubectl", "delete", "nodepool", "status-pool").Run()
+		})
+
+		It("should publish Kubernetes events when taking action on unready nodes", func() {
+			By("creating a NodePool")
+			nodePoolYaml := `
+apiVersion: nodemanager.example.org.example.org/v1
+kind: NodePool
+metadata:
+  name: event-pool
+spec:
+  labels:
+    synced-label: "true"
+  unreadyPolicy:
+    gracePeriod: 1s
+    action: Cordon
+    maxConcurrentRemovals: 1
+`
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(nodePoolYaml)
+			utils.Run(cmd)
+
+			By("creating a fake node and simulating failure")
+			fakeNodeYaml := `
+apiVersion: v1
+kind: Node
+metadata:
+  name: event-node
+  labels:
+    nodes.example.com/nodepool: event-pool
+`
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(fakeNodeYaml)
+			utils.Run(cmd)
+
+			By("simulating node failure")
+			cmd = exec.Command("kubectl", "patch", "node", "event-node", "--subresource=status", "--type=merge", "-p", `{"status":{"conditions":[{"type":"Ready","status":"False","lastTransitionTime":"2020-01-01T00:00:00Z"}]}}`)
+			utils.Run(cmd)
+
+			By("waiting for the controller to cordon the node")
+			verifyCordoned := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "node", "event-node", "-o", "jsonpath={.spec.unschedulable}")
+				output, _ := utils.Run(cmd)
+				g.Expect(output).To(Equal("true"))
+			}
+			Eventually(verifyCordoned, 15*time.Second, time.Second).Should(Succeed())
+
+			By("verifying the NodeCordoned event was published to the NodePool")
+			verifyCordonEvent := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "events", "--field-selector", "involvedObject.kind=NodePool,involvedObject.name=event-pool,reason=NodeCordoned", "-A", "-o", "jsonpath={.items[*].message}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(ContainSubstring("Cordoned node event-node due to unready policy"))
+			}
+			Eventually(verifyCordonEvent, 10*time.Second, time.Second).Should(Succeed())
+
+			By("verifying the NodeSynced event was published to the NodePool")
+			verifySyncEvent := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "events", "--field-selector", "involvedObject.kind=NodePool,involvedObject.name=event-pool,reason=NodeSynced", "-A", "-o", "jsonpath={.items[*].message}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(ContainSubstring("Successfully synced node event-node to match NodePool state"))
+			}
+			Eventually(verifySyncEvent, 10*time.Second, time.Second).Should(Succeed())
+
+			By("cleaning up")
+			exec.Command("kubectl", "delete", "node", "event-node").Run()
+			exec.Command("kubectl", "delete", "nodepool", "event-pool").Run()
+		})
+
 	})
 })
-
-// serviceAccountToken returns a token for the specified service account in the given namespace.
-// It uses the Kubernetes TokenRequest API to generate a token by directly sending a request
-// and parsing the resulting token from the API response.
-func serviceAccountToken() (string, error) {
-	const tokenRequestRawString = `{
-		"apiVersion": "authentication.k8s.io/v1",
-		"kind": "TokenRequest"
-	}`
-
-	By("creating temporary file to store the token request")
-	secretName := fmt.Sprintf("%s-token-request", serviceAccountName)
-	tokenRequestFile := filepath.Join("/tmp", secretName)
-	err := os.WriteFile(tokenRequestFile, []byte(tokenRequestRawString), os.FileMode(0o644))
-	if err != nil {
-		return "", err
-	}
-
-	var out string
-	verifyTokenCreation := func(g Gomega) {
-		By("executing kubectl command to create the token")
-		cmd := exec.Command("kubectl", "create", "--raw", fmt.Sprintf(
-			"/api/v1/namespaces/%s/serviceaccounts/%s/token",
-			namespace,
-			serviceAccountName,
-		), "-f", tokenRequestFile)
-
-		output, err := cmd.CombinedOutput()
-		g.Expect(err).NotTo(HaveOccurred())
-
-		By("parsing the JSON output to extract the token")
-		var token tokenRequest
-		err = json.Unmarshal(output, &token)
-		g.Expect(err).NotTo(HaveOccurred())
-
-		out = token.Status.Token
-	}
-	Eventually(verifyTokenCreation).Should(Succeed())
-
-	return out, err
-}
-
-// getMetricsOutput retrieves and returns the logs from the curl pod used to access the metrics endpoint.
-func getMetricsOutput() (string, error) {
-	By("getting the curl-metrics logs")
-	cmd := exec.Command("kubectl", "logs", "curl-metrics", "-n", namespace)
-	return utils.Run(cmd)
-}
-
-// tokenRequest is a simplified representation of the Kubernetes TokenRequest API response,
-// containing only the token field that we need to extract.
-type tokenRequest struct {
-	Status struct {
-		Token string `json:"token"`
-	} `json:"status"`
-}

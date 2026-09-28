@@ -6,6 +6,10 @@ cliVersion: 4.16.0
 domain: example.org
 layout:
 - go.kubebuilder.io/v4
+plugins:
+  helm.kubebuilder.io/v2-alpha:
+    manifests: dist/install.yaml
+    output: charts
 projectName: k8s-nodepool-controller
 repo: github.com/nishant95/k8s-nodepool-controller
 resources:

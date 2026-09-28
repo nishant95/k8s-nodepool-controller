@@ -17,50 +17,16 @@ limitations under the License.
 package v1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
-
-// NodePoolSpec defines the desired state of NodePool
-type NodePoolSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-	// The following markers will use OpenAPI v3 schema to validate the value
-	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
-
-	// foo is an example field of NodePool. Edit nodepool_types.go to remove/update
-	// +optional
-	Foo *string `json:"foo,omitempty"`
-}
-
-// NodePoolStatus defines the observed state of NodePool.
-type NodePoolStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-
-	// For Kubernetes API conventions, see:
-	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
-
-	// conditions represent the current state of the NodePool resource.
-	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
-	//
-	// Standard condition types include:
-	// - "Available": the resource is fully functional
-	// - "Progressing": the resource is being created or updated
-	// - "Degraded": the resource failed to reach or maintain its desired state
-	//
-	// The status of each condition is one of True, False, or Unknown.
-	// +listType=map
-	// +listMapKey=type
-	// +optional
-	Conditions []metav1.Condition `json:"conditions,omitempty"`
-}
-
+// +kubebuilder:resource:scope=Cluster
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Ready",type=integer,JSONPath=".status.readyNodes",description="Number of ready nodes"
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
 
 // NodePool is the Schema for the nodepools API
 type NodePool struct {
@@ -86,6 +52,104 @@ type NodePoolList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitzero"`
 	Items           []NodePool `json:"items"`
+}
+
+// NodePoolSpec defines the desired state of NodePool
+type NodePoolSpec struct {
+	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
+	// Important: Run "make" to regenerate code after modifying this file
+	// The following markers will use OpenAPI v3 schema to validate the value
+	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
+
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// +optional
+	Labels map[string]string `json:"labels,omitempty"`
+
+	// +optional
+	Taints []corev1.Taint `json:"taints,omitempty"`
+
+	UnreadyPolicy UnreadyPolicy `json:"unreadyPolicy"`
+}
+
+// NodePoolStatus defines the observed state of NodePool.
+type NodePoolStatus struct {
+	// conditions represent the current state of the NodePool resource.
+	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
+	//
+	// Standard condition types include:
+	// - "Available": the resource is fully functional
+	// - "Progressing": the resource is being created or updated
+	// - "Degraded": the resource failed to reach or maintain its desired state
+	//
+	// The status of each condition is one of True, False, or Unknown.
+	// +listType=map
+	// +listMapKey=type
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// ReadyNodes is the number of nodes in the pool that are currently ready.
+	// +optional
+	ReadyNodes int32 `json:"readyNodes,omitempty"`
+
+	// Nodes is a list of nodes in the pool, along with their current phase and any relevant timestamps.
+	// +optional
+	Nodes []NodeStatus `json:"nodes,omitempty"`
+
+	// ObservedGeneration is the most recent generation observed by the controller.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+}
+
+// UnreadyNodeAction defines the possible actions to take on unready nodes.
+// +kubebuilder:validation:Enum=Remove;Cordon;Ignore
+type UnreadyNodeAction string
+
+const (
+	ActionRemove UnreadyNodeAction = "Remove"
+	ActionCordon UnreadyNodeAction = "Cordon"
+	ActionIgnore UnreadyNodeAction = "Ignore"
+)
+
+// UnreadyPolicy defines how to handle nodes that remain unready.
+type UnreadyPolicy struct {
+	// GracePeriod is how long a node may remain unready before action is taken.
+	// +kubebuilder:default="5m"
+	GracePeriod metav1.Duration `json:"gracePeriod"`
+
+	// Action specifies the action to take.
+	// +kubebuilder:default=Remove
+	Action UnreadyNodeAction `json:"action"`
+
+	// MaxConcurrentRemovals limits the number of nodes removed concurrently.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=1
+	MaxConcurrentRemovals int32 `json:"maxConcurrentRemovals"`
+}
+
+// NodePhase defines the observed lifecycle phase of a node.
+// +kubebuilder:validation:Enum=Ready;NotReady;Unknown;Removing;Draining
+type NodePhase string
+
+const (
+	NodePhaseReady    NodePhase = "Ready"
+	NodePhaseNotReady NodePhase = "NotReady"
+	NodePhaseUnknown  NodePhase = "Unknown"
+	NodePhaseRemoving NodePhase = "Removing"
+	NodePhaseDraining NodePhase = "Draining"
+)
+
+// NodeStatus defines the observed state of a node in the pool.
+type NodeStatus struct {
+	// Name is the Kubernetes node name.
+	Name string `json:"name"`
+
+	// Phase is the current lifecycle phase of the node.
+	Phase NodePhase `json:"phase"`
+
+	// NotReadySince is when the node became not ready.
+	NotReadySince *metav1.Time `json:"notReadySince,omitempty"`
 }
 
 func init() {
